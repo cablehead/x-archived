@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/alexflint/go-arg"
 )
@@ -28,8 +30,9 @@ type commandSplit struct {
 }
 
 type commandExec struct {
-	Command string   `arg:"positional,required"`
-	Args    []string `arg:"positional"`
+	Timeout time.Duration `arg:"-t"`
+	Command string        `arg:"positional,required"`
+	Args    []string      `arg:"positional"`
 }
 
 func main() {
@@ -54,6 +57,7 @@ func main() {
 
 	if args.Exec != nil {
 		doExec(args.Exec)
+		fmt.Println("done done")
 	}
 }
 
@@ -191,16 +195,80 @@ func doSplit(args *commandSplit) {
 	}
 }
 
-func doExec(args *commandExec) {
-	cmd := exec.Command(args.Command, args.Args...)
+func parseLines(reader io.Reader) <-chan string {
+	c := make(chan string)
+	go func() {
+		scanner := bufio.NewScanner(reader)
+		for scanner.Scan() {
+			c <- scanner.Text()
+		}
+		close(c)
+	}()
+	return c
+}
 
-	cmd.Stdin = os.Stdin
+func execCommand(command string, args []string) *exec.Cmd {
+	cmd := exec.Command(command, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func doExec(args *commandExec) {
+	if args.Timeout > 0 {
+		// fmt.Println("will timeout")
+	}
+
+	p := parseLines(os.Stdin)
+	ticker := time.NewTicker(args.Timeout)
+
+	cmd := execCommand(args.Command, args.Args)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		panic(err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		panic(err)
 	}
+
+read_stdin:
+	for {
+		select {
+		case line, ok := <-p:
+			if !ok {
+				// looks like our stdin closed
+				// fmt.Println("not ok")
+				_ = stdin.Close()
+				break read_stdin
+			}
+			_, err := fmt.Fprintf(stdin, "%s\n", line)
+			if err != nil {
+				// looks like the subprocess stdin closed
+				_ = os.Stdin.Close()
+				break read_stdin
+			}
+
+		case <-ticker.C:
+			// fmt.Println("Tick at", t)
+			stdin.Close()
+			if err := cmd.Wait(); err != nil {
+				panic(err)
+			}
+
+			cmd = execCommand(args.Command, args.Args)
+			stdin, err = cmd.StdinPipe()
+			if err != nil {
+				panic(err)
+			}
+
+			if err = cmd.Start(); err != nil {
+				panic(err)
+			}
+		}
+	}
+	// fmt.Println("stdin done")
 
 	if err := cmd.Wait(); err != nil {
 		if err, ok := err.(*exec.ExitError); ok {
@@ -208,4 +276,6 @@ func doExec(args *commandExec) {
 		}
 		panic(err)
 	}
+
+	fmt.Println("out", os.Getpid())
 }
